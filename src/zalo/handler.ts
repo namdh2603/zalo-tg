@@ -12,7 +12,7 @@ import { config } from '../config.js';
 import { downloadToTemp, cleanTemp } from '../utils/media.js';
 import { applyZaloMarkupHtml, formatGroupMsgHtml, formatGroupMsg, groupCaption, topicName, truncate, escapeHtml } from '../utils/format.js';
 import type { ZaloStyle } from '../utils/format.js';
-import { msgStore, userCache, pollStore, sentMsgStore, zaloAlbumStore, reactionEchoStore, reactionSummaryStore, aliasCache, friendsCache, recentlyRecalledMsgIds, type ZaloQuoteData } from '../store.js';
+import { msgStore, userCache, pollStore, sentMsgStore, zaloAlbumStore, reactionEchoStore, reactionSummaryStore, reactionEventDedupeStore, aliasCache, friendsCache, recentlyRecalledMsgIds, type ZaloQuoteData } from '../store.js';
 import { tgQueue } from '../utils/tgQueue.js';
 
 // Proxy that routes every tg.* call through the rate-limit queue
@@ -1472,6 +1472,17 @@ ${escapeHtml(photoCaption)}`
     }
   });
 
+  // Catch-up stream from zca-js after reconnect.
+  // Replays recent messages through the same main handler to refill bridges.
+  api.listener.on('old_messages', (messages: ZaloMessage[]) => {
+    if (!Array.isArray(messages) || messages.length === 0) return;
+    const sorted = [...messages].sort((a, b) => Number(a?.data?.ts ?? 0) - Number(b?.data?.ts ?? 0));
+    console.log(`[Zalo→TG] Catch-up old_messages: replay ${sorted.length} item(s)`);
+    for (const oldMsg of sorted) {
+      api.listener.emit('message', oldMsg);
+    }
+  });
+
   // ── Undo (thu hồi tin nhắn) ────────────────────────────────────────────────
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   api.listener.on('undo', async (undo: any) => {
@@ -1574,21 +1585,44 @@ ${escapeHtml(photoCaption)}`
       // If empty reaction icon → user removed reaction; skip notification
       if (!rIcon) return;
 
-      const gMsgIds: Array<{ gMsgID?: string | number }> = data?.content?.rMsg ?? [];
-      const zaloMsgId = String(gMsgIds[0]?.gMsgID ?? '');
-      if (!zaloMsgId) return;
+      const rMsgs: Array<{ gMsgID?: string | number; cMsgID?: string | number }> = data?.content?.rMsg ?? [];
+      const targetMsgIds = Array.from(new Set([
+        String(rMsgs[0]?.gMsgID ?? ''),
+        String(rMsgs[0]?.cMsgID ?? ''),
+        String(data?.msgId ?? ''),
+        String(data?.cliMsgId ?? ''),
+      ].map(id => id.trim()).filter(id => id && id !== '0')));
+      if (targetMsgIds.length === 0) return;
 
       const zaloId = String(reaction?.threadId ?? data?.idTo ?? "");
       if (!zaloId) return;
 
-      if (reaction?.isSelf && reactionEchoStore.consume(zaloId, zaloMsgId, rIcon)) {
-        console.log("[ZaloHandler] Reaction: skip bridge echo for " + zaloId + "/" + zaloMsgId + "/" + rIcon);
+      const actorUid = typeof data?.uidFrom === 'string' ? data.uidFrom.trim() : '';
+      const rawName = typeof data?.dName === 'string' ? data.dName.trim() : '';
+
+      if (reactionEventDedupeStore.isDuplicateZaloInbound({
+        zaloId,
+        targetMsgIds,
+        icon: rIcon,
+        actorUid: actorUid || undefined,
+        actorName: rawName || undefined,
+      })) {
+        console.log(`[ZaloHandler] Reaction: skip duplicate event ${zaloId}/${targetMsgIds.join('|')}/${rIcon}`);
         return;
       }
 
-      const tgMsgId = msgStore.getTgMsgId(zaloMsgId) ?? sentMsgStore.getByZaloMsgId(zaloMsgId);
+      if (reaction?.isSelf && targetMsgIds.some(msgId => reactionEchoStore.consume(zaloId, msgId, rIcon))) {
+        console.log(`[ZaloHandler] Reaction: skip bridge echo for ${zaloId}/${targetMsgIds.join('|')}/${rIcon}`);
+        return;
+      }
+
+      let tgMsgId: number | undefined;
+      for (const msgId of targetMsgIds) {
+        tgMsgId = msgStore.getTgMsgId(msgId) ?? sentMsgStore.getByZaloMsgId(msgId);
+        if (tgMsgId !== undefined) break;
+      }
       if (tgMsgId === undefined) {
-        console.log(`[ZaloHandler] Reaction: no TG mapping for zaloMsgId=${zaloMsgId}`);
+        console.log(`[ZaloHandler] Reaction: no TG mapping for target=${targetMsgIds.join('|')}`);
         return;
       }
 
@@ -1596,9 +1630,7 @@ ${escapeHtml(photoCaption)}`
       const topicId = store.getTopicByZalo(zaloId, type);
       if (topicId === undefined) return;
 
-      const rawName = typeof data?.dName === 'string' ? data.dName.trim() : '';
-      const actorUid = typeof data?.uidFrom === 'string' ? data.uidFrom : undefined;
-      const actorName = rawName || await resolveUserDisplayName(api, actorUid, 'ai đó');
+      const actorName = rawName || await resolveUserDisplayName(api, actorUid || undefined, 'ai đó');
 
       // Aggregate reactions: update the summary entry then debounce send/edit
       const entry = reactionSummaryStore.upsert(tgMsgId, emoji, actorName);
@@ -1644,6 +1676,17 @@ ${escapeHtml(photoCaption)}`
       }, 600);
     } catch (err) {
       console.error('[ZaloHandler] Reaction error:', err);
+    }
+  });
+
+  // Catch-up stream from zca-js after reconnect.
+  // Replays reaction history through the same reaction pipeline + dedupe.
+  api.listener.on('old_reactions', (reactions: any[], isGroup: boolean) => {
+    if (!Array.isArray(reactions) || reactions.length === 0) return;
+    console.log(`[Zalo→TG] Catch-up old_reactions: replay ${reactions.length} item(s), isGroup=${isGroup}`);
+    for (const reaction of reactions) {
+      if (reaction && reaction.isGroup === undefined) reaction.isGroup = isGroup;
+      api.listener.emit('reaction', reaction);
     }
   });
 
